@@ -19,7 +19,9 @@ Properties
 	[HideInInspector] _Outline2Color	("Outline 2 Color", Color) = (0,0,0,1)
 	[HideInInspector] _Outline2Width	("Inner Inward", Range(0, 0.5)) = 0
 	[HideInInspector] _InnerOutward		("Inner Outward", Range(0, 0.5)) = 0
+	[HideInInspector] _InnerSoftness	("Inner Softness", Range(0, 1)) = 0
 	[HideInInspector] _OuterRenderWidth	("Outer Render Width", float) = 0
+	[HideInInspector] _OuterSoftness	("Outer Softness", Range(0, 1)) = 0
 
 	[HideInInspector] _WeightNormal		("Weight Normal", float) = 0
 	[HideInInspector] _WeightBold		("Weight Bold", float) = 0.5
@@ -68,6 +70,21 @@ Properties
 	[HideInInspector] _UnderlayOffsetY	("Underlay OffsetY", Range(-1,1)) = 0
 	[HideInInspector] _UnderlayDilate	("Underlay Dilate", Range(-1,1)) = 0
 	[HideInInspector] _UnderlaySoftness	("Underlay Softness", Range(0,1)) = 0
+
+	// Glow
+	[HideInInspector] _GlowColor		("Glow Color", Color) = (1,1,0,0.5)
+	[HideInInspector] _GlowOffset		("Glow Offset", Range(-1,1)) = 0
+	[HideInInspector] _GlowInner		("Glow Inner", Range(0,1)) = 0.05
+	[HideInInspector] _GlowOuter		("Glow Outer", Range(0,1)) = 0.45
+	[HideInInspector] _GlowPower		("Glow Power", Range(0.1,8)) = 1
+
+	// Lighting
+	[HideInInspector] _LightAngle		("Light Angle", Range(0,6.2832)) = 3.1416
+	[HideInInspector] _SpecularColor	("Specular Color", Color) = (1,1,1,1)
+	[HideInInspector] _SpecularPower	("Specular Power", Range(0,1)) = 0.5
+	[HideInInspector] _Reflectivity		("Reflectivity", Range(0,5)) = 1
+	[HideInInspector] _Diffuse			("Diffuse Intensity", Range(0,1)) = 0.5
+	[HideInInspector] _Ambient			("Ambient", Range(0,1)) = 0.5
 }
 
 SubShader
@@ -146,7 +163,9 @@ SubShader
 		fixed4		_Outline2Color;
 		float		_Outline2Width;
 		float		_InnerOutward;
+		float		_InnerSoftness;
 		float		_OuterRenderWidth;
+		float		_OuterSoftness;
 
 		// Shadow
 		fixed4		_ShadowColor;
@@ -155,6 +174,21 @@ SubShader
 		float		_ShadowDilate;
 		float		_ShadowSoftness;
 		float		_AtlasPadding;
+
+		// Glow
+		fixed4		_GlowColor;
+		float		_GlowOffset;
+		float		_GlowInner;
+		float		_GlowOuter;
+		float		_GlowPower;
+
+		// Lighting
+		float		_LightAngle;
+		fixed4		_SpecularColor;
+		float		_SpecularPower;
+		float		_Reflectivity;
+		float		_Diffuse;
+		float		_Ambient;
 
 		// ── Structs ──────────────────────────────────────────────────────────
 		struct vertex_t
@@ -284,18 +318,23 @@ SubShader
 			float innerIn    = (_Outline2Width   * _ScaleRatioA) * scale;
 			float innerOut   = (_InnerOutward    * _ScaleRatioA) * scale;
 
+			// ── Softness (screen-space) ──
+			float innerSoft = max(1.0, _InnerSoftness * _ScaleRatioA * scale);
+			float outerSoft = max(1.0, _OuterSoftness * _ScaleRatioA * scale);
+
 			// ── Boundary masks ──
-			float pureFaceMask = saturate(0.5 - sd - innerIn);
-			float faceMask = saturate(0.5 - sd);
-			float innerOutMask = saturate(innerOut + 0.5 - sd);
-			float outerEdgeMask = saturate(outerWidth + 0.5 - sd);
+			// Khi softness = 0: max(1,0) = 1 → smoothstep(1,0,x) ≈ saturate(x) (sharp edge)
+			// Khi softness > 0: transition mượt hơn
+			float pureFaceMask = smoothstep(innerSoft, 0, sd - (0.5 - innerIn));
+			float faceMask     = smoothstep(innerSoft, 0, sd - 0.5);
+			float innerOutMask = smoothstep(innerSoft, 0, sd - (0.5 + innerOut));
+			float outerEdgeMask = smoothstep(outerSoft, 0, sd - (0.5 + outerWidth));
 
 			float maxOutward = max(outerWidth, innerOut);
-			float totalMask = saturate(maxOutward + 0.5 - sd);
+			float maxSoft = max(innerSoft, outerSoft);
+			float totalMask = smoothstep(maxSoft, 0, sd - (0.5 + maxOutward));
 
 			// Ngăn outline/shadow tràn ra ngoài vùng SDF hợp lệ
-			// c > 0 = pixel nằm trong vùng SDF field (~GradientScale/2 texels từ glyph edge)
-			// c ≈ 0 = pixel ở rìa/ngoài SDF field → mọi UV offset đều sample neighbor glyph
 			float sdfLimit = smoothstep(0.0, 0.05, c);
 			totalMask *= sdfLimit;
 			outerEdgeMask *= sdfLimit;
@@ -305,18 +344,74 @@ SubShader
 			half3 fRGB = _FaceColor.rgb * input.color.rgb;
 			fRGB *= tex2D(_FaceTex, input.textures.xy + float2(_FaceUVSpeedX, _FaceUVSpeedY) * _Time.y).rgb;
 
+			// ── Lighting (Bevel) ── Modulate face color bằng SDF normals ──
+			if (_Diffuse > 0.001 || _Reflectivity > 0.001)
+			{
+				// Pseudo-normals từ SDF gradient (screen-space derivatives)
+				float2 sdfGrad = float2(ddx(c), ddy(c));
+				float3 normal = normalize(float3(sdfGrad * 200.0, 1.0));
+
+				// Light direction từ angle (XY plane)
+				float3 lightDir = normalize(float3(cos(_LightAngle), sin(_LightAngle), 0.5));
+
+				// Diffuse (Lambert)
+				float diffuse = max(0, dot(normal, lightDir));
+				float lighting = lerp(_Ambient, 1.0, diffuse * _Diffuse);
+				fRGB *= lighting;
+
+				// Specular (Blinn-Phong)
+				float3 halfDir = normalize(lightDir + float3(0, 0, 1));
+				float spec = pow(max(0, dot(normal, halfDir)), _SpecularPower * 128.0 + 1.0);
+				fRGB += _SpecularColor.rgb * spec * _Reflectivity * faceMask;
+			}
+
 			half3 innerRGB = _OutlineColor.rgb;
 			innerRGB *= tex2D(_OutlineTex, input.textures.zw + float2(_OutlineUVSpeedX, _OutlineUVSpeedY) * _Time.y).rgb;
 
 			half3 outerRGB = _Outline2Color.rgb;
 
-			// ── Composite back-to-front: Outer → InnerOut → InnerIn → Face ──
-			half3 color = outerRGB;
-			color = lerp(color, innerRGB, innerOutMask);
-			color = lerp(color, innerRGB, faceMask);
-			color = lerp(color, fRGB, pureFaceMask);
+			// ── Alpha từ outline color ──
+			float innerAlpha = _OutlineColor.a;
+			float outerAlpha = _Outline2Color.a;
 
-			float textAlpha = totalMask;
+			// ── Composite back-to-front: Outer → Inner → Face ──
+			float hasInner = step(0.001, innerIn + innerOut);
+
+			half3 color = outerRGB;
+			float outerZoneMask = totalMask * outerAlpha;
+
+			color = lerp(color, innerRGB, innerOutMask * hasInner * innerAlpha);
+			color = lerp(color, innerRGB, faceMask * hasInner * innerAlpha);
+
+			float effectiveFaceMask = lerp(faceMask, pureFaceMask, hasInner);
+			color = lerp(color, fRGB, effectiveFaceMask);
+
+			// ── Final alpha ──
+			float innerZoneMask = saturate(max(innerOutMask, faceMask) - effectiveFaceMask) * hasInner;
+			float outerOnlyMask = saturate(totalMask - max(innerOutMask * hasInner, faceMask));
+			float textAlpha = effectiveFaceMask
+			                + innerZoneMask * innerAlpha
+			                + outerOnlyMask * outerAlpha;
+
+			// ── Glow ── Soft halo ring quanh text edge ──
+			float glowAlpha = 0;
+			half3 glowRGB = _GlowColor.rgb;
+			if (_GlowColor.a > 0.001)
+			{
+				float glowOffset = _GlowOffset * _ScaleRatioA * scale;
+				float glowInner = max(0.001, _GlowInner * _ScaleRatioA * scale);
+				float glowOuter = max(0.001, _GlowOuter * _ScaleRatioA * scale);
+
+				// Distance from glow center (offset from text edge)
+				float glowDist = abs(sd - (0.5 + glowOffset));
+
+				// Smooth ring: 1 at center, fading both directions
+				float glowMask = 1.0 - smoothstep(glowInner, glowOuter, glowDist);
+				glowMask = pow(saturate(glowMask), _GlowPower);
+				glowMask *= sdfLimit; // prevent SDF bleed
+
+				glowAlpha = glowMask * _GlowColor.a;
+			}
 
 			// ── Shadow ──
 			float shadowAlpha = 0;
@@ -326,18 +421,22 @@ SubShader
 				float dilate = _ShadowDilate * _ScaleRatioA * scale;
 				float soft = max(1.0, _ShadowSoftness * _ScaleRatioA * scale);
 
-				// Shadow bao gồm cả outline: trừ maxOutward để shadow khớp hình dạng text+outline
 				shadowAlpha = _ShadowColor.a * smoothstep(soft, 0, sdS - dilate - maxOutward);
-
-				// Noise filter: loại SDF artifacts từ bilinear filtering
 				shadowAlpha *= smoothstep(0.0, 0.05, cS);
 			}
 
-			// ── Composite shadow behind text ──
+			// ── Composite: Text → Glow (behind text) → Shadow (back-most) ──
+			// Layer 1: Glow behind text
+			float textGlowAlpha = textAlpha + glowAlpha * (1.0 - textAlpha);
+			half3 textGlowColor = (textGlowAlpha > 0.001)
+				? (color * textAlpha + glowRGB * glowAlpha * (1.0 - textAlpha)) / textGlowAlpha
+				: half3(0,0,0);
+
+			// Layer 2: Shadow behind text+glow
 			half3 shadowRGB = _ShadowColor.rgb;
-			float finalAlpha = textAlpha + shadowAlpha * (1.0 - textAlpha);
+			float finalAlpha = textGlowAlpha + shadowAlpha * (1.0 - textGlowAlpha);
 			half3 finalColor = (finalAlpha > 0.001)
-				? (color * textAlpha + shadowRGB * shadowAlpha * (1.0 - textAlpha)) / finalAlpha
+				? (textGlowColor * textGlowAlpha + shadowRGB * shadowAlpha * (1.0 - textGlowAlpha)) / finalAlpha
 				: half3(0,0,0);
 
 			// Output premultiplied alpha
