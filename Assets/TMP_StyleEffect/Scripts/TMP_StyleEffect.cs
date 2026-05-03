@@ -109,19 +109,66 @@ public class TMP_StyleEffect : MonoBehaviour
     Material _mat;
     Material _lastBaseMat;   // Track font base material để detect đổi font
     bool _applying;
+#if UNITY_EDITOR
+    bool _editorApplyQueued;
+#endif
 
     void OnEnable()
     {
         TMPro_EventManager.TEXT_CHANGED_EVENT.Add(OnTMPChanged);
-        Apply();
+        RequestApply();
     }
 
     void OnDisable()
     {
         TMPro_EventManager.TEXT_CHANGED_EVENT.Remove(OnTMPChanged);
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.delayCall -= ApplyQueuedInEditor;
+        _editorApplyQueued = false;
+#endif
     }
 
-    void OnValidate() => Apply();
+    void OnValidate()
+    {
+#if UNITY_EDITOR
+        if (!Application.isPlaying)
+        {
+            QueueApplyInEditor();
+            return;
+        }
+#endif
+
+        RequestApply();
+    }
+
+    public void RequestApply()
+    {
+        if (_applying) return;
+
+        Apply();
+    }
+
+#if UNITY_EDITOR
+    void QueueApplyInEditor()
+    {
+        if (_editorApplyQueued) return;
+
+        _editorApplyQueued = true;
+        UnityEditor.EditorApplication.delayCall += ApplyQueuedInEditor;
+        UnityEditor.EditorApplication.QueuePlayerLoopUpdate();
+    }
+
+    void ApplyQueuedInEditor()
+    {
+        UnityEditor.EditorApplication.delayCall -= ApplyQueuedInEditor;
+        _editorApplyQueued = false;
+
+        if (this == null || !isActiveAndEnabled)
+            return;
+
+        Apply();
+    }
+#endif
 
     /// <summary>
     /// Khi TMP regenerate mesh (đổi font, text, size…) → re-apply effect.
@@ -130,7 +177,7 @@ public class TMP_StyleEffect : MonoBehaviour
     void OnTMPChanged(Object obj)
     {
         if (obj == (Object)_tmp)
-            Apply();
+            RequestApply();
     }
 
     void Apply()
@@ -155,8 +202,9 @@ public class TMP_StyleEffect : MonoBehaviour
             // Tạo material từ font base material, đổi shader
             Material baseMat = _tmp.font.material;
             bool fontChanged = _lastBaseMat != baseMat;
+            bool needsFreshMaskMaterial = IsUnderActiveMask();
 
-            if (_mat == null || _mat.shader != shader || fontChanged)
+            if (_mat == null || _mat.shader != shader || fontChanged || needsFreshMaskMaterial)
             {
                 if (_mat != null)
                     DestroyImmediate(_mat);
@@ -216,16 +264,16 @@ public class TMP_StyleEffect : MonoBehaviour
             float inOut = innerEnabled ? innerOutward : 0f;
             float inSoft = innerEnabled ? innerSoftness : 0f;
             _mat.SetColor(ID_OutlineColor, innerColor);
-            _mat.SetFloat(ID_Outline2Width, inIn);
-            _mat.SetFloat(ID_InnerOutward, inOut);
-            _mat.SetFloat(ID_InnerSoftness, inSoft);
+            _mat.SetFloat(ID_Outline2Width, GetScaleAdjustedEffectWidth(inIn));
+            _mat.SetFloat(ID_InnerOutward, GetScaleAdjustedEffectWidth(inOut));
+            _mat.SetFloat(ID_InnerSoftness, GetScaleAdjustedEffectWidth(inSoft));
 
             // ── Outer outline ──
             float outW = outerEnabled ? outline2Width : 0f;
             float outSoft = outerEnabled ? outline2Softness : 0f;
             _mat.SetColor(ID_Outline2Color, outline2Color);
-            _mat.SetFloat(ID_OuterRenderWidth, outW);
-            _mat.SetFloat(ID_OuterSoftness, outSoft);
+            _mat.SetFloat(ID_OuterRenderWidth, GetScaleAdjustedEffectWidth(outW));
+            _mat.SetFloat(ID_OuterSoftness, GetScaleAdjustedEffectWidth(outSoft));
 
             // _OutlineWidth → TMP dùng để tính padding cho quad mesh & alphaClip
             // Phải bao gồm softness để vertex shader không clip pixel ở vùng soft edge
@@ -238,8 +286,8 @@ public class TMP_StyleEffect : MonoBehaviour
                 _mat.SetColor(ID_ShadowColor, shadowColor);
                 _mat.SetFloat(ID_ShadowOffsetX, shadowOffset.x);
                 _mat.SetFloat(ID_ShadowOffsetY, shadowOffset.y);
-                _mat.SetFloat(ID_ShadowDilate, shadowDilate);
-                _mat.SetFloat(ID_ShadowSoftness, shadowSoftness);
+                _mat.SetFloat(ID_ShadowDilate, GetScaleAdjustedEffectWidth(shadowDilate));
+                _mat.SetFloat(ID_ShadowSoftness, GetScaleAdjustedEffectWidth(shadowSoftness));
 
                 // Atlas padding → shader clamp shadow UV vào vùng an toàn
                 int effectivePadding = atlasPaddingOverride > 0
@@ -276,9 +324,9 @@ public class TMP_StyleEffect : MonoBehaviour
             if (glowEnabled)
             {
                 _mat.SetColor(ID_GlowColor, glowColor);
-                _mat.SetFloat(ID_GlowOffset, glowOffset);
-                _mat.SetFloat(ID_GlowInner, glowInner);
-                _mat.SetFloat(ID_GlowOuter, glowOuter);
+                _mat.SetFloat(ID_GlowOffset, GetScaleAdjustedEffectWidth(glowOffset));
+                _mat.SetFloat(ID_GlowInner, GetScaleAdjustedEffectWidth(glowInner));
+                _mat.SetFloat(ID_GlowOuter, GetScaleAdjustedEffectWidth(glowOuter));
                 _mat.SetFloat(ID_GlowPower, glowPower);
 
                 // Glow extends outward → needs padding
@@ -306,16 +354,32 @@ public class TMP_StyleEffect : MonoBehaviour
                 _mat.SetFloat(ID_Reflectivity, 0);
             }
 
-            _mat.SetFloat(ID_OutlineWidth, Mathf.Min(paddingWidth, 1f));
+            float renderPaddingWidth = Mathf.Min(paddingWidth, 1f);
+            _mat.SetFloat(ID_OutlineWidth, GetScaleAdjustedMeshPaddingWidth(renderPaddingWidth));
 
             // Gán material
             _tmp.fontMaterial = _mat;
+            _tmp.RecalculateMasking();
 
             // QUAN TRỌNG: Bật extraPadding để TMP thêm buffer cho quad mesh
             _tmp.extraPadding = extraPadding;
 
+            _tmp.UpdateMeshPadding();
+            _tmp.SetMaterialDirty();
+            _tmp.SetVerticesDirty();
+
             // Force rebuild mesh (tính lại padding cho outline mới)
             _tmp.ForceMeshUpdate();
+
+#if UNITY_EDITOR
+            if (!Application.isPlaying)
+            {
+                UnityEditor.EditorUtility.SetDirty(_tmp);
+                UnityEditor.EditorUtility.SetDirty(this);
+                UnityEditor.EditorApplication.QueuePlayerLoopUpdate();
+                UnityEditor.SceneView.RepaintAll();
+            }
+#endif
         }
         finally
         {
@@ -325,7 +389,51 @@ public class TMP_StyleEffect : MonoBehaviour
 
     void OnDestroy()
     {
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.delayCall -= ApplyQueuedInEditor;
+#endif
         if (_mat != null)
             DestroyImmediate(_mat);
+    }
+
+    bool IsUnderActiveMask()
+    {
+        Transform t = transform;
+        while (t != null)
+        {
+            var mask = t.GetComponent<UnityEngine.UI.Mask>();
+            if (mask != null && mask.enabled)
+                return true;
+
+            var rectMask = t.GetComponent<UnityEngine.UI.RectMask2D>();
+            if (rectMask != null && rectMask.enabled)
+                return true;
+
+            t = t.parent;
+        }
+
+        return false;
+    }
+
+    float GetScaleAdjustedMeshPaddingWidth(float width)
+    {
+        return GetScaleAdjustedEffectWidth(width);
+    }
+
+    float GetScaleAdjustedEffectWidth(float width)
+    {
+        if (Mathf.Approximately(width, 0f))
+            return 0f;
+
+        Vector3 scale = transform.lossyScale;
+        float minScale = Mathf.Min(Mathf.Abs(scale.x), Mathf.Abs(scale.y));
+        if (minScale <= 0f)
+            return width;
+
+        float sign = Mathf.Sign(width);
+        float magnitude = Mathf.Abs(width);
+        return minScale < 1f
+            ? sign * Mathf.Min(magnitude / Mathf.Max(minScale, 0.01f), 128f)
+            : width;
     }
 }

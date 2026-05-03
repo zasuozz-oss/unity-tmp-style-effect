@@ -138,7 +138,6 @@ public class TMP_StyleEffectEditor : Editor
             if (enableProp != null && toggleRect.Contains(e.mousePosition))
             {
                 enableProp.boolValue = !enableProp.boolValue;
-                serializedObject.ApplyModifiedProperties();
             }
             else
             {
@@ -183,6 +182,7 @@ public class TMP_StyleEffectEditor : Editor
     public override void OnInspectorGUI()
     {
         serializedObject.Update();
+        EditorGUI.BeginChangeCheck();
 
         EditorGUILayout.Space(2);
 
@@ -198,7 +198,23 @@ public class TMP_StyleEffectEditor : Editor
         // Bottom splitter
         DrawSplitter();
 
-        serializedObject.ApplyModifiedProperties();
+        bool guiChanged = EditorGUI.EndChangeCheck();
+        bool propertiesChanged = serializedObject.ApplyModifiedProperties();
+
+        if (guiChanged || propertiesChanged)
+            RequestApplyForTargets();
+    }
+
+    void RequestApplyForTargets()
+    {
+        foreach (Object obj in targets)
+        {
+            if (obj is TMP_StyleEffect effect)
+            {
+                effect.RequestApply();
+                EditorUtility.SetDirty(effect);
+            }
+        }
     }
 
     // ── Face ─────────────────────────────────────────────────────────────
